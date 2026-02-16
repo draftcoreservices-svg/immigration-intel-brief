@@ -1,0 +1,7 @@
+# One email per line. Lines starting with # are ignored.
+# Example:
+# someone@lawfirm.co.uk
+hello@draftcore.co.uk
+rushi.work3003@gmail.com
+rushi.lime49@gmail.com
+rushi.spam3003@gmail.com
