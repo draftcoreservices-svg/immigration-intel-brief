@@ -1,41 +1,46 @@
+# src/main.py
 import os
+import re
 import json
 import hashlib
-import html as html_escape
 import pathlib
-import re
+import html
 from datetime import datetime
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytz
 import requests
 
-from .sources import fetch_all_sources
-from .emailer import send_email
 from .utils import load_settings
+from .sources import fetch_all_sources
 from .summarise import summarise_item
+from .emailer import send_email
+
+USER_AGENT = "DraftCore-Immigration-Intel-Brief/2.1"
 
 CACHE_DIR = pathlib.Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
 STATE_PATH = CACHE_DIR / "state.json"
 
-USER_AGENT = "DraftCore-Immigration-Intel-Brief/1.1"
 
-
-# ----------------------------
-# Time gating (DST-safe)
-# ----------------------------
+# -----------------------------
+# Scheduling gate (DST-safe)
+# -----------------------------
 def should_send_now(tz_name: str, send_hour_local: int) -> bool:
+    """
+    GitHub Actions cron uses UTC. We run two crons (07:00 + 08:00 UTC) and gate here
+    based on Europe/London local hour. This ensures the job sends once at the desired
+    local time even across DST.
+    """
     tz = pytz.timezone(tz_name)
     now_local = datetime.now(tz)
-    # small window so the double-UTC cron doesn't send twice
-    return now_local.hour == send_hour_local and now_local.minute < 20
+    return now_local.hour == int(send_hour_local) and now_local.minute < 20
 
 
-# ----------------------------
-# State storage
-# ----------------------------
+# -----------------------------
+# State (dedupe + update detect)
+# -----------------------------
 def load_state() -> Dict[str, Any]:
     if not STATE_PATH.exists():
         return {"items": {}}
@@ -49,11 +54,9 @@ def save_state(state: Dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def normalise_url(url: str) -> str:
-    u = (url or "").split("#")[0].strip()
+    u = (url or "").strip()
+    u = u.split("#")[0]
     if u.endswith("/"):
         u = u[:-1]
     return u
@@ -63,6 +66,9 @@ def sha256_text(s: str) -> str:
     return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
 
+# -----------------------------
+# Text extraction helpers
+# -----------------------------
 def strip_html_basic(html_text: str) -> str:
     if not html_text:
         return ""
@@ -72,56 +78,17 @@ def strip_html_basic(html_text: str) -> str:
     return t
 
 
-# ----------------------------
-# Relevance scoring (reduce GOV.UK noise)
-# ----------------------------
-STRONG_TERMS = [
-    "immigration", "ukvi", "visa", "visas", "evisa", "e-visa", "eta",
-    "asylum", "refugee", "nationality", "citizenship", "border",
-    "immigration rules", "statement of changes", "leave to remain", "ilr",
-    "indefinite leave", "settlement", "sponsor licence", "sponsor license",
-    "skilled worker", "student visa", "family visa", "human rights",
-    "deportation", "removal", "immigration enforcement",
-    "modern slavery", "trafficking", "national referral mechanism", "nrm",
-    "utiac", "upper tribunal", "first-tier tribunal",
-]
-
-MEDIUM_TERMS = [
-    "fees", "guidance", "policy", "consultation", "sponsor", "compliance",
-    "right to work", "right to rent", "civil penalty", "sanctions",
-]
-
-EXCLUDE_PHRASES = [
-    "police custody",
-    "pre-charge bail",
-    "strip searches",
-]
-
-def relevance_score(text: str) -> int:
-    t = (text or "").lower()
-    score = 0
-    for term in STRONG_TERMS:
-        if term in t:
-            score += 3
-    for term in MEDIUM_TERMS:
-        if term in t:
-            score += 1
-    for phrase in EXCLUDE_PHRASES:
-        if phrase in t:
-            score -= 3
-    return score
-
-
 def fetch_full_text(item: Dict[str, Any]) -> Tuple[str, Optional[str]]:
     """
-    Returns (plain_text, last_modified_hint).
-    Uses GOV.UK Content API when possible; falls back to page fetch.
+    Returns (plain_text, last_modified_hint)
+    - For GOV.UK pages: tries /api/content (best structured signal + updated_at).
+    - Otherwise: fetches page and strips HTML.
     """
     url = normalise_url(item.get("url", ""))
     if not url:
         return "", None
 
-    # GOV.UK Content API
+    # GOV.UK structured API for richer extract + update date
     if url.startswith("https://www.gov.uk/"):
         try:
             path = url.replace("https://www.gov.uk", "")
@@ -133,8 +100,8 @@ def fetch_full_text(item: Dict[str, Any]) -> Tuple[str, Optional[str]]:
                 title = data.get("title") or item.get("title") or ""
                 desc = data.get("description") or ""
                 details = data.get("details") or {}
-                body = ""
 
+                body = ""
                 if isinstance(details.get("body"), str):
                     body = details.get("body", "")
                 elif isinstance(details.get("parts"), list):
@@ -149,7 +116,7 @@ def fetch_full_text(item: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         except Exception:
             pass
 
-    # Fallback: fetch HTML page
+    # Fallback generic fetch
     try:
         r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -157,31 +124,84 @@ def fetch_full_text(item: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         plain = strip_html_basic(r.text)
         return plain[:20000], lm
     except Exception:
-        summary = item.get("summary", "") or ""
+        # last resort: title + summary
         title = item.get("title", "") or ""
+        summary = item.get("summary", "") or ""
         return (title + "\n" + summary).strip(), None
 
 
+# -----------------------------
+# Tight relevance + critical alerts
+# -----------------------------
+CRITICAL_TRIGGERS = [
+    "statement of changes",
+    "immigration rules",
+    "appendix",
+    "fees",
+    "fee increase",
+    "fee changes",
+    "comes into force",
+    "effective from",
+    "takes effect",
+    "in force",
+    "cpin",
+    "country policy and information note",
+    "caseworker guidance",
+    "staff guidance",
+    "sponsor licence suspended",
+    "sponsor license suspended",
+    "sponsor licence revoked",
+    "sponsor license revoked",
+    "civil penalty",
+    "compliance visit",
+]
+
+
+def critical_score(text: str) -> int:
+    t = (text or "").lower()
+    score = 0
+    for s in CRITICAL_TRIGGERS:
+        if s in t:
+            score += 2
+    if "statement of changes" in t or "immigration rules" in t:
+        score += 4
+    return score
+
+
 def filter_items(items: List[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    # Stage 1: keyword prefilter (fast)
+    """
+    Stage-1 filter: keep items that match keywords OR are clearly core immigration instruments.
+    Then attach critical score and sort critical-first.
+    """
     kws = [k.lower() for k in (keywords or [])]
     out: List[Dict[str, Any]] = []
-
     for it in items:
         hay = " ".join(
-            [it.get("title", ""), it.get("summary", ""), it.get("source", ""), it.get("url", "")]
+            [
+                it.get("title", ""),
+                it.get("summary", ""),
+                it.get("source", ""),
+                it.get("url", ""),
+            ]
         ).lower()
 
-        if kws and not any(k in hay for k in kws):
+        core_override = (
+            "statement of changes" in hay
+            or "immigration rules" in hay
+            or "cpin" in hay
+            or "country policy and information note" in hay
+            or "caseworker guidance" in hay
+            or "staff guidance" in hay
+            or "sponsor guidance" in hay
+        )
+
+        if kws and not any(k in hay for k in kws) and not core_override:
             continue
 
-        # Stage 2: score threshold
-        score = relevance_score(hay)
-        if score >= 3:
-            it["__relevance_score"] = score
-            out.append(it)
+        it["__critical_score"] = critical_score(hay)
+        out.append(it)
 
-    out.sort(key=lambda x: x.get("__relevance_score", 0), reverse=True)
+    out.sort(key=lambda x: int(x.get("__critical_score", 0)), reverse=True)
     return out
 
 
@@ -198,101 +218,154 @@ def classify_section(source: str) -> str:
     return "Other"
 
 
+# -----------------------------
+# Mailing list
+# -----------------------------
+def load_mailing_list() -> List[str]:
+    """
+    Reads config/mailing_list.txt (one email per line).
+    Lines starting with # are ignored. Returns deduped list.
+    """
+    p = pathlib.Path("config/mailing_list.txt")
+    if not p.exists():
+        return []
+    emails: List[str] = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        emails.append(ln)
+
+    seen: Set[str] = set()
+    out: List[str] = []
+    for e in emails:
+        k = e.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(e)
+    return out
+
+
+# -----------------------------
+# Email rendering
+# -----------------------------
 def build_subject(tz_name: str) -> str:
     tz = pytz.timezone(tz_name)
     d = datetime.now(tz).strftime("%Y-%m-%d")
     return f"Immigration Intelligence Brief — {d}"
 
 
-def _ai_to_html(ai_text: str) -> str:
-    """
-    Converts AI output into nice HTML:
-    - if it contains bullet lines, render as <ul>
-    - otherwise render as paragraphs
-    """
+def ai_to_html(ai_text: str) -> str:
     lines = [ln.strip() for ln in (ai_text or "").splitlines() if ln.strip()]
     bullets = [ln for ln in lines if ln.startswith(("-", "•", "*"))]
     if bullets:
         lis = "".join(
-            f"<li style='margin:0 0 6px 0;'>{html_escape.escape(ln.lstrip('-•* ').strip())}</li>"
+            f"<li style='margin:0 0 6px 0;'>{html.escape(ln.lstrip('-•* ').strip())}</li>"
             for ln in bullets[:12]
         )
-        return f"<ul style='margin:10px 0 0 18px;color:#0F172A;font-size:13px;line-height:1.45;'>{lis}</ul>"
-    # fallback
-    text = html_escape.escape(" ".join(lines)[:1200])
+        return (
+            "<ul style='margin:10px 0 0 18px;color:#0F172A;font-size:13px;line-height:1.45;'>"
+            f"{lis}</ul>"
+        )
+    text = html.escape(" ".join(lines)[:1200])
     return f"<div style='margin-top:10px;color:#0F172A;font-size:13px;line-height:1.5;'>{text}</div>"
 
 
-def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[str, Any]], tz_name: str) -> str:
+def render_email_html(
+    new_items: List[Dict[str, Any]],
+    updated_items: List[Dict[str, Any]],
+    tz_name: str,
+) -> str:
     subject = build_subject(tz_name)
 
-    # TL;DR top 3
-    combined = []
-    for it in (items_updated + items_new):
-        score = it.get("__relevance_score")
-        if score is None:
-            score = relevance_score(" ".join([it.get("title",""), it.get("summary",""), it.get("source",""), it.get("url","")]))
-        combined.append((int(score), it))
+    combined = [(int(it.get("__critical_score", 0)), it) for it in (updated_items + new_items)]
     combined.sort(key=lambda x: x[0], reverse=True)
     top3 = [it for _, it in combined[:3]]
 
+    critical_items = [
+        it for it in (updated_items + new_items) if int(it.get("__critical_score", 0)) >= 4
+    ][:6]
+
+    def badge_style(label: str) -> Tuple[str, str, str]:
+        if label == "NEW":
+            return ("#EFF6FF", "#BFDBFE", "#1D4ED8")
+        return ("#FFF7ED", "#FED7AA", "#9A3412")
+
     def card(it: Dict[str, Any], badge: str, prev: Optional[str] = None) -> str:
-        title = html_escape.escape(it.get("title", "(untitled)"))
-        url = html_escape.escape(it.get("url", ""))
+        title = html.escape(it.get("title", "(untitled)"))
+        url = html.escape(it.get("url", ""))
         ai_summary = it.get("ai_summary", "")
 
         prev_html = ""
         if prev:
             prev_html = (
                 "<div style='color:#64748B;font-size:12px;margin-top:6px;'>"
-                f"Previously covered: <b>{html_escape.escape(prev)}</b>"
+                f"Previously covered: <b>{html.escape(prev)}</b>"
                 "</div>"
             )
 
-        badge_bg = "#EFF6FF" if badge == "NEW" else "#FFF7ED"
-        badge_border = "#BFDBFE" if badge == "NEW" else "#FED7AA"
-        badge_text = "#1D4ED8" if badge == "NEW" else "#9A3412"
+        bg, border, color = badge_style(badge)
 
         return f"""
-          <div style="margin:0 0 14px 0;padding:14px;border:1px solid #E5E7EB;border-radius:14px;background:#FFFFFF;">
-            <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;">
-              <span style="font-size:11px;font-weight:800;padding:4px 10px;border-radius:999px;background:{badge_bg};border:1px solid {badge_border};color:{badge_text};letter-spacing:0.2px;">
-                {html_escape.escape(badge)}
-              </span>
-              <div style="font-weight:800;font-size:14px;color:#0F172A;">
-                <a href="{url}" style="color:#0F172A;text-decoration:none;">{title}</a>
-              </div>
-            </div>
-            {prev_html}
-            {_ai_to_html(ai_summary)}
-          </div>
-        """
+<div style="margin:0 0 14px 0;padding:14px;border:1px solid #E5E7EB;border-radius:14px;background:#FFFFFF;">
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;">
+    <span style="font-size:11px;font-weight:800;padding:4px 10px;border-radius:999px;background:{bg};border:1px solid {border};color:{color};letter-spacing:0.2px;">
+      {html.escape(badge)}
+    </span>
+    <div style="font-weight:800;font-size:14px;color:#0F172A;">
+      <a href="{url}" style="color:#0F172A;text-decoration:none;">{title}</a>
+    </div>
+  </div>
+  {prev_html}
+  {ai_to_html(ai_summary)}
+</div>
+"""
 
-    # group items
-    buckets_new = defaultdict(list)
-    for it in items_new:
+    # Bucket by section
+    buckets_new: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for it in new_items:
         buckets_new[classify_section(it.get("source", ""))].append(it)
 
-    buckets_upd = defaultdict(list)
-    for it in items_updated:
+    buckets_upd: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for it in updated_items:
         buckets_upd[classify_section(it.get("source", ""))].append(it)
 
     parts: List[str] = []
 
-    # Header counts
     parts.append(
         f"<div style='margin:10px 0 14px 0;color:#334155;font-size:13px;'>"
-        f"<b>Updated:</b> {len(items_updated)} &nbsp;|&nbsp; <b>New:</b> {len(items_new)}"
+        f"<b>Updated:</b> {len(updated_items)} &nbsp;|&nbsp; <b>New:</b> {len(new_items)}"
         f"</div>"
     )
+
+    # Critical alerts banner
+    if critical_items:
+        lis = []
+        for it in critical_items:
+            title = html.escape(it.get("title", "(untitled)"))
+            url = html.escape(it.get("url", ""))
+            badge = "UPDATED" if it in updated_items else "NEW"
+            lis.append(
+                f"<li style='margin:0 0 6px 0;'>"
+                f"<span style='font-size:11px;font-weight:900;padding:2px 8px;border-radius:999px;border:1px solid #FECACA;background:#FFFFFF;margin-right:6px;color:#991B1B;'>{badge}</span>"
+                f"<a href='{url}' style='color:#991B1B;text-decoration:none;font-weight:800;'>{title}</a>"
+                f"</li>"
+            )
+        parts.append(
+            "<div style='margin:14px 0 16px 0;padding:14px;border:1px solid #FECACA;border-radius:14px;background:#FEF2F2;'>"
+            "<div style='font-weight:900;font-size:14px;color:#991B1B;margin:0 0 8px 0;'>🚨 Critical alerts</div>"
+            f"<ul style='margin:0;padding-left:18px;color:#991B1B;font-size:13px;line-height:1.45;'>{''.join(lis)}</ul>"
+            "</div>"
+        )
 
     # TL;DR
     if top3:
         lis = []
         for it in top3:
-            badge = "UPDATED" if it in items_updated else "NEW"
-            title = html_escape.escape(it.get("title","(untitled)"))
-            url = html_escape.escape(it.get("url",""))
+            badge = "UPDATED" if it in updated_items else "NEW"
+            title = html.escape(it.get("title", "(untitled)"))
+            url = html.escape(it.get("url", ""))
             lis.append(
                 f"<li style='margin:0 0 6px 0;'>"
                 f"<span style='font-size:11px;font-weight:800;padding:2px 8px;border-radius:999px;border:1px solid #E5E7EB;background:#FFFFFF;margin-right:6px;color:#0F172A;'>{badge}</span>"
@@ -306,29 +379,33 @@ def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[
             "</div>"
         )
 
-    # Updated section first
-    if items_updated:
+    # Updated section
+    if updated_items:
         parts.append("<div style='margin:18px 0 10px 0;border-top:1px solid #E5E7EB;'></div>")
         parts.append("<h2 style='margin:14px 0 10px 0;font-size:16px;color:#0F172A;'>Updated since last brief</h2>")
         for section in ["GOV.UK", "Parliament", "Legislation", "Courts & Tribunals", "Other"]:
             if not buckets_upd.get(section):
                 continue
-            parts.append(f"<h3 style='margin:14px 0 8px 0;font-size:14px;color:#0F172A;'>{html_escape.escape(section)}</h3>")
+            parts.append(
+                f"<h3 style='margin:14px 0 8px 0;font-size:14px;color:#0F172A;'>{html.escape(section)}</h3>"
+            )
             for it in buckets_upd[section][:12]:
                 parts.append(card(it, "UPDATED", prev=it.get("previously_covered")))
 
     # New section
-    if items_new:
+    if new_items:
         parts.append("<div style='margin:18px 0 10px 0;border-top:1px solid #E5E7EB;'></div>")
         parts.append("<h2 style='margin:14px 0 10px 0;font-size:16px;color:#0F172A;'>New items</h2>")
         for section in ["GOV.UK", "Parliament", "Legislation", "Courts & Tribunals", "Other"]:
             if not buckets_new.get(section):
                 continue
-            parts.append(f"<h3 style='margin:14px 0 8px 0;font-size:14px;color:#0F172A;'>{html_escape.escape(section)}</h3>")
+            parts.append(
+                f"<h3 style='margin:14px 0 8px 0;font-size:14px;color:#0F172A;'>{html.escape(section)}</h3>"
+            )
             for it in buckets_new[section][:12]:
                 parts.append(card(it, "NEW"))
 
-    if not items_new and not items_updated:
+    if not new_items and not updated_items:
         parts.append(
             "<div style='margin-top:12px;padding:14px;border:1px solid #E5E7EB;border-radius:14px;background:#FFFFFF;color:#334155;'>"
             "<b>No material updates detected</b> for this run."
@@ -337,8 +414,7 @@ def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[
 
     inner = "\n".join(parts)
 
-    # Nice outer template
-    return f"""\
+    return f"""
 <html>
   <body style="margin:0;padding:0;background:#F1F5F9;font-family:Arial, sans-serif;color:#0F172A;">
     <div style="max-width:820px;margin:0 auto;padding:22px;">
@@ -348,7 +424,7 @@ def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[
             <div style="font-size:12px;color:#64748B;font-weight:700;letter-spacing:0.3px;">
               DraftCore • by Rushi Trivedi
             </div>
-            <h1 style="margin:6px 0 0 0;font-size:22px;line-height:1.2;">{html_escape.escape(subject)}</h1>
+            <h1 style="margin:6px 0 0 0;font-size:22px;line-height:1.2;">{html.escape(subject)}</h1>
           </div>
         </div>
 
@@ -361,7 +437,7 @@ def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[
         </div>
 
         <div style="margin-top:18px;border-top:1px solid #E5E7EB;padding-top:12px;color:#64748B;font-size:12px;">
-          Sources monitored: GOV.UK, Parliament, legislation.gov.uk, and Courts/Tribunals (where available).
+          Sources monitored: GOV.UK (targeted), Parliament, legislation.gov.uk, Courts/Tribunals (where available).
         </div>
       </div>
     </div>
@@ -370,13 +446,18 @@ def render_email_html(items_new: List[Dict[str, Any]], items_updated: List[Dict[
 """
 
 
-def main():
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def main() -> None:
     settings = load_settings("config/settings.yaml")
+    tz_name = settings.get("timezone", "Europe/London")
+    send_hour_local = int(settings.get("send_hour_local", settings.get("send_hour_local", 7)))
+    always_send = bool(settings.get("always_send", True))
 
-    # Scheduled runs: only send at configured local hour.
-    # Manual runs: send immediately.
+    # Gate only for scheduled runs; manual dispatch should always run
     if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
-        if not should_send_now(settings["timezone"], settings["send_hour_local"]):
+        if not should_send_now(tz_name, send_hour_local):
             return
 
     state = load_state()
@@ -385,13 +466,13 @@ def main():
     raw_items = fetch_all_sources(settings)
     filtered = filter_items(raw_items, settings.get("keywords", []))
 
-    tz = pytz.timezone(settings["timezone"])
+    tz = pytz.timezone(tz_name)
     now_local = datetime.now(tz).strftime("%Y-%m-%d")
 
     new_items: List[Dict[str, Any]] = []
     updated_items: List[Dict[str, Any]] = []
 
-    MAX_CANDIDATES = 30  # caps OpenAI cost
+    MAX_CANDIDATES = int(settings.get("max_candidates", 25))
     processed = 0
 
     for it in filtered:
@@ -403,9 +484,9 @@ def main():
             continue
 
         prev = state_items.get(url)
-        prior_last_seen = prev.get("last_seen") if prev else None
+        prior_seen = prev.get("last_seen") if prev else None
         prior_hash = prev.get("last_content_hash") if prev else None
-        prior_last_modified = prev.get("last_modified") if prev else None
+        prior_lm = prev.get("last_modified") if prev else None
 
         full_text, lm_hint = fetch_full_text(it)
         content_hash = sha256_text(full_text)
@@ -415,34 +496,28 @@ def main():
         else:
             if content_hash != prior_hash:
                 status = "UPDATED"
-            elif lm_hint and (prior_last_modified is None or str(lm_hint) != str(prior_last_modified)):
+            elif lm_hint and (prior_lm is None or str(lm_hint) != str(prior_lm)):
                 status = "UPDATED"
             else:
                 status = "SKIP"
 
         if status == "SKIP":
-            prev["last_seen"] = now_local
+            # Touch last_seen so it doesn’t look stale in state
+            try:
+                prev["last_seen"] = now_local
+            except Exception:
+                pass
             continue
 
-        try:
-            ai = summarise_item(
-                title=it.get("title", ""),
-                content=full_text,
-                is_update=(status == "UPDATED"),
-            )
-        except Exception:
-            ai = (
-                "- Summary unavailable (AI error)\n"
-                "- Please open the source link for details."
-            )
+        ai = summarise_item(title=it.get("title", ""), content=full_text, is_update=(status == "UPDATED"))
 
         out = dict(it)
         out["ai_summary"] = ai
 
-        if status == "UPDATED" and prior_last_seen:
-            out["previously_covered"] = prior_last_seen
+        if status == "UPDATED" and prior_seen:
+            out["previously_covered"] = prior_seen
 
-        # Update state
+        # Update state record
         if prev is None:
             state_items[url] = {
                 "first_seen": now_local,
@@ -469,12 +544,28 @@ def main():
     state["items"] = state_items
     save_state(state)
 
-    # If nothing to report: optionally still send a 'no material updates' brief
-    if not new_items and not updated_items and not settings.get("always_send", False):
+    if not new_items and not updated_items and not always_send:
         return
 
-    subject = build_subject(settings["timezone"])
-    html_email = render_email_html(new_items, updated_items, settings["timezone"])
+    subject = build_subject(tz_name)
+    html_email = render_email_html(new_items, updated_items, tz_name)
+
+    # Recipients: TO_EMAIL + config/mailing_list.txt
+    recipients: List[str] = []
+    env_to = os.environ.get("TO_EMAIL", "").strip()
+    if env_to:
+        recipients.append(env_to)
+    recipients.extend(load_mailing_list())
+
+    # Final dedupe
+    seen: Set[str] = set()
+    final: List[str] = []
+    for r in recipients:
+        k = r.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        final.append(r)
 
     send_email(
         smtp_host=os.environ["SMTP_HOST"],
@@ -482,7 +573,7 @@ def main():
         smtp_user=os.environ["SMTP_USER"],
         smtp_pass=os.environ["SMTP_PASS"],
         from_email=os.environ["FROM_EMAIL"],
-        to_email=os.environ["TO_EMAIL"],
+        to_email=final,
         subject=subject,
         html=html_email,
     )
