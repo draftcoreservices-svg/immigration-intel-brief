@@ -115,6 +115,10 @@ def render_email_html(items, tz_name):
 def main():
     settings = load_settings("config/settings.yaml")
 
+# If this is a scheduled run, only send at 08:00 London time.
+# If it's a manual run, send immediately.
+import os
+if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
     if not should_send_now(settings["timezone"], settings["send_hour_local"]):
         return
 
