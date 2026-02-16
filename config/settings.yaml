@@ -1,5 +1,5 @@
 timezone: "Europe/London"
-send_hour_local: 8
+send_hour_local: 7
 
 keywords:
   - immigration
