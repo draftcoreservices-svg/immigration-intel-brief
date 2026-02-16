@@ -66,11 +66,16 @@ def render_email_html(items, tz_name):
     buckets = defaultdict(list)
     for it in items:
         src = it.get("source","Other")
-        if "GOV.UK" in src: buckets["GOV.UK"].append(it)
-        elif "Parliament" in src: buckets["Parliament"].append(it)
-        elif "legislation.gov.uk" in src: buckets["Legislation"].append(it)
-        elif "Judiciary" in src or "UTIAC" in src: buckets["Courts & Tribunals"].append(it)
-        else: buckets["Other"].append(it)
+        if "GOV.UK" in src:
+            buckets["GOV.UK"].append(it)
+        elif "Parliament" in src:
+            buckets["Parliament"].append(it)
+        elif "legislation.gov.uk" in src:
+            buckets["Legislation"].append(it)
+        elif "Judiciary" in src or "UTIAC" in src:
+            buckets["Courts & Tribunals"].append(it)
+        else:
+            buckets["Other"].append(it)
 
     def item_html(it):
         title = html.escape(it.get("title","(untitled)"))
@@ -115,12 +120,11 @@ def render_email_html(items, tz_name):
 def main():
     settings = load_settings("config/settings.yaml")
 
-# If this is a scheduled run, only send at 08:00 London time.
-# If it's a manual run, send immediately.
-import os
-if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
-    if not should_send_now(settings["timezone"], settings["send_hour_local"]):
-        return
+    # Scheduled runs: only send at 08:00 London time (DST-safe).
+    # Manual runs: send immediately.
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        if not should_send_now(settings["timezone"], settings["send_hour_local"]):
+            return
 
     seen = load_seen()
 
