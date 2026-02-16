@@ -1,0 +1,40 @@
+timezone: "Europe/London"
+send_hour_local: 7
+
+
+always_send: true
+keywords:
+  - immigration
+  - asylum
+  - refugee
+  - border
+  - nationality
+  - citizenship
+  - deportation
+  - removal
+  - detention
+  - sponsor licence
+  - sponsor license
+  - skilled worker
+  - global talent
+  - student visa
+  - family visa
+  - evisa
+  - eta
+  - illegal migration
+  - trafficking
+  - modern slavery
+
+govuk:
+  organisations:
+    - home-office
+    - uk-visas-and-immigration
+
+parliament:
+  rss_all_bills: "https://www.parliament.uk/business/bills-and-legislation/rss/"
+
+legislation:
+  atom_new_legislation: "https://www.legislation.gov.uk/new/data.feed"
+
+judiciary:
+  rss_utiac: "https://www.judiciary.uk/feed/?post_type=utiac_decision"
