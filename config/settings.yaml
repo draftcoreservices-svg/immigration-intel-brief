@@ -1,0 +1,72 @@
+timezone: "Europe/London"
+send_hour_local: 8
+
+always_send: true
+
+# Keep the brief tightly immigration-focused. Items must exceed this threshold
+# (unless they hit a core override such as "Immigration Rules" / "Statement of changes").
+relevance_min_score: 6
+
+# Hard exclusions to reduce "general UK politics" noise.
+exclude_keywords:
+  - academies
+  - education
+  - child poverty
+  - schools
+  - bus services
+  - net zero
+  - farming
+  - fisheries
+  - armed forces
+  - potholes
+keywords:
+  - immigration
+  - asylum
+  - refugee
+  - border
+  - nationality
+  - citizenship
+  - deportation
+  - removal
+  - detention
+  - sponsor licence
+  - sponsor license
+  - skilled worker
+  - global talent
+  - student visa
+  - family visa
+  - evisa
+  - eta
+  - illegal migration
+  - trafficking
+  - modern slavery
+
+# High-signal phrases that usually indicate a practitioner-impacting update.
+high_signal_phrases:
+  - statement of changes
+  - immigration rules
+  - appendix
+  - sponsor guidance
+  - caseworker guidance
+  - staff guidance
+  - country policy and information note
+  - cpin
+  - fees
+  - right to work
+  - right to rent
+  - eta
+  - evisa
+
+govuk:
+  organisations:
+    - home-office
+    - uk-visas-and-immigration
+
+parliament:
+  rss_all_bills: "https://www.parliament.uk/business/bills-and-legislation/rss/"
+
+legislation:
+  atom_new_legislation: "https://www.legislation.gov.uk/new/data.feed"
+
+judiciary:
+  rss_utiac: "https://www.judiciary.uk/feed/?post_type=utiac_decision"
